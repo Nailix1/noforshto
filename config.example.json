@@ -1,0 +1,12 @@
+{
+  "bot_token": "",
+  "client_bot_token": "",
+  "admin_id": 0,
+  "tetradka_token": "",
+  "booking_url": "https://link.tetradka.io/box/187686",
+  "miniapp_url": "",
+  "miniapp_host": "0.0.0.0",
+  "miniapp_port": 8787,
+  "booking_enabled": true,
+  "salon_address": "Разъезжая 42/34, Санкт-Петербург"
+}
