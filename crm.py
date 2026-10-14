@@ -268,16 +268,22 @@ def bearer(*, force: bool = False) -> str:
         return external
     if not crm_configured():
         raise CRMAuthError('CRM Tetradka не подключена.', code='credentials_missing')
+    # NEFOR_TETRADKA_FORCE_LOGIN=1 — принудительный перелогин.
+    # Нужен один раз при смене владельца: стирает старый кеш токена,
+    # чтобы записи уходили к новому аккаунту Tetradka.
+    if os.environ.get('NEFOR_TETRADKA_FORCE_LOGIN') == '1' and not force:
+        force = True
     with _AUTH_LOCK:
         if force:
             _TOKEN = ''
             _cache_path().unlink(missing_ok=True)
         if _TOKEN:
             return _TOKEN
-        cached = _load_cached()
-        if cached:
-            _TOKEN = cached[0]
-            return _TOKEN
+        if not force:
+            cached = _load_cached()
+            if cached:
+                _TOKEN = cached[0]
+                return _TOKEN
         pwd = os.environ['NEFOR_TETRADKA_PASSWORD']
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
         first = _post_auth(opener, '/api/auth/login', {
@@ -286,9 +292,17 @@ def bearer(*, force: bool = False) -> str:
         if not isinstance(roles, list) or not roles:
             raise CRMAuthError('Tetradka не вернула ролей.', code='roles_missing')
         candidates = [r for r in roles if isinstance(r, dict) and r.get('type') == 'business']
-        if len(candidates) != 1:
-            raise CRMAuthError('Нужна единственная роль владельца.', code='business_role_count_invalid')
-        uid = candidates[0].get('userID')
+        if not candidates:
+            raise CRMAuthError('Tetradka не вернула роль владельца.', code='business_role_missing')
+        # Если в аккаунте несколько салонов, можно явно указать нужный через
+        # NEFOR_TETRADKA_BUSINESS_USER_ID. Иначе берём первую бизнес-роль.
+        want = os.environ.get('NEFOR_TETRADKA_BUSINESS_USER_ID', '').strip()
+        if want:
+            candidates = [c for c in candidates if str(c.get('userID')) == want]
+            if not candidates:
+                raise CRMAuthError('Не найдена роль с указанным ID.', code='business_user_id_not_found')
+        candidate = candidates[0]
+        uid = candidate.get('userID')
         if not uid:
             raise CRMAuthError('У роли владельца нет ID.', code='business_user_id_missing')
         second = _post_auth(opener, '/api/auth/v2/login-by-id', {'userID': uid, 'password': pwd})
