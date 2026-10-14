@@ -9,9 +9,9 @@ from storage import norm_phone
 
 BASE_URL = 'https://booking-api.tbookme.ru'
 # ID онлайн-записи салона в Tetradka.
-# 187686 — старый салон. Твой ID задаётся через Railway Variables:
-#   NEFOR_TETRADKA_ONLINE_ID=232569
-ONLINE_ID = os.environ.get('NEFOR_TETRADKA_ONLINE_ID', '232569')
+# По умолчанию 187686 — рабочий салон. Можно переопределить через env
+# NEFOR_TETRADKA_ONLINE_ID (например, для теста на другом салоне).
+ONLINE_ID = os.environ.get('NEFOR_TETRADKA_ONLINE_ID', '187686')
 CRM_ROOT = 'https://tetradka.io'
 MSK = timezone(timedelta(hours=3))
 MAX_TIMEOUT = 12
@@ -22,6 +22,10 @@ _CATALOG_LOCK = threading.Lock()
 _TOKEN = ''
 _TOKEN_EXPIRES = 0.0
 _AUTH_LOCK = threading.RLock()
+# Флаг: принудительный перелогин через NEFOR_TETRADKA_FORCE_LOGIN уже выполнен.
+# Нужен, чтобы переменная срабатывала только один раз за запуск процесса,
+# а не при каждом обращении к Tetradka (иначе будет HTTP 422 «слишком часто»).
+_FORCED_LOGIN_DONE = False
 
 
 class BookingError(Exception):
@@ -149,11 +153,19 @@ def _request_json(method: str, url: str, body, timeout: int = MAX_TIMEOUT):
                     raise BookingError('Некорректный ответ.', 502, 'upstream')
         except urllib.error.HTTPError as exc:
             code = exc.code
+            try:
+                raw = exc.read(8192).decode('utf-8', 'replace')
+                try:
+                    parsed = json.loads(raw)
+                except ValueError:
+                    parsed = {'raw': raw[:400]}
+            except Exception:
+                parsed = None
             exc.close()
             if is_read and attempt + 1 < tries and code in (429, 502, 503, 504):
                 time.sleep(.35)
                 continue
-            return code, None
+            return code, parsed
         except (OSError, TimeoutError) as exc:
             if is_read and attempt + 1 < tries:
                 time.sleep(.35)
@@ -228,9 +240,15 @@ def _post_auth(opener, route: str, body: dict) -> dict:
         with opener.open(req, timeout=16) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as exc:
+        code = exc.code
+        try:
+            detail = exc.read(1024).decode('utf-8', 'replace')[:300]
+        except Exception:
+            detail = ''
         exc.close()
-        raise CRMAuthError(f'Tetradka отклонила вход (HTTP {exc.code}).',
-                           code=f'{phase}_http_{exc.code}') from None
+        print(f'[CRM_AUTH] {phase} code={code} detail={detail}', flush=True)
+        raise CRMAuthError(f'Tetradka отклонила вход (HTTP {code}).',
+                           code=f'{phase}_http_{code}') from None
     except (OSError, ValueError, TimeoutError) as exc:
         raise CRMAuthError('Не удалось связаться с авторизацией Tetradka.',
                            code=f'{phase}_network_{type(exc).__name__}') from None
@@ -265,15 +283,19 @@ def note_verified_read(auth_header: str) -> None:
 
 
 def bearer(*, force: bool = False) -> str:
-    global _TOKEN
+    global _TOKEN, _FORCED_LOGIN_DONE
     external = cfg('tetradka_token') or os.environ.get('NEFOR_TETRADKA_TOKEN', '')
     if external:
         return external
     if not crm_configured():
         raise CRMAuthError('CRM Tetradka не подключена.', code='credentials_missing')
-    # NEFOR_TETRADKA_FORCE_LOGIN=1 — принудительный перелогин.
-    if os.environ.get('NEFOR_TETRADKA_FORCE_LOGIN') == '1' and not force:
+    # NEFOR_TETRADKA_FORCE_LOGIN=1 принудительно сбрасывает закешированный токен
+    # РОВНО ОДИН РАЗ за запуск процесса. Дальше используется обычный кеш.
+    # Это защищает от HTTP 422 «слишком много попыток входа»: если переменную
+    # случайно оставят включённой, код не будет логиниться на каждый запрос.
+    if os.environ.get('NEFOR_TETRADKA_FORCE_LOGIN') == '1' and not force and not _FORCED_LOGIN_DONE:
         force = True
+        _FORCED_LOGIN_DONE = True
     with _AUTH_LOCK:
         if force:
             _TOKEN = ''
@@ -501,14 +523,27 @@ def create_booking(payload: dict, *, verify_slot: bool = True) -> dict:
         'pairs': [pair], 'date': validated['date'], 'timeFrom': validated['timeFrom'],
         'tetradkaPersonalDataProcessing': True}
     code, result = _request_json('POST', _booking_url('/store'), body)
+    if code != 201:
+        detail = ''
+        try:
+            detail = json.dumps(result, ensure_ascii=False)[:600] if isinstance(result, dict) else str(result)[:400]
+        except Exception:
+            detail = ''
+        print(f'[CRM_POST_STORE] code={code} body={detail}', flush=True)
     if code in (409, 422):
         raise BookingError('На это время не удалось записаться. Обновите расписание.', 409, 'time_unavailable')
     if code == 429:
         raise BookingError('Слишком много запросов. Попробуйте позднее.', 429, 'rate_limited')
     if code >= 500:
         raise BookingError('Ответ Tetradka неизвестен. Проверьте запись у администратора.', 503, 'uncertain')
+    if code == 400:
+        raise BookingError('Tetradka отклонила запрос (400). Возможно, нет прав на услугу или час занят.', 400, 'bad_request')
+    if code == 403:
+        raise BookingError('Tetradka отклонила запрос (403). Требуется повторный вход.', 403, 'forbidden')
+    if code == 404:
+        raise BookingError('Tetradka не нашла мастера или услугу (404). Обнови каталог.', 404, 'not_found')
     if code != 201:
-        raise BookingError('Tetradka не подтвердила создание записи.', 502, 'upstream')
+        raise BookingError(f'Tetradka не подтвердила создание записи (код {code}).', 502, 'upstream')
     if not isinstance(result, dict) or type(result.get('visitID')) is not int or result['visitID'] <= 0:
         raise BookingError('Ответ Tetradka неизвестен. Проверьте запись.', 503, 'uncertain')
     if type(result.get('addressID')) is not int:
