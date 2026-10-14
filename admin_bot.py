@@ -8,7 +8,7 @@ from config import cfg
 
 MSK = timezone(timedelta(hours=3))
 ADDRESS = 'Разъезжая 42/34, вход в арку рядом с КБ, домофон 55'
-RELEASE = 'NEFOR SPOT 9.4'
+RELEASE = 'NEFOR SPOT 9.5'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('nefor-admin')
@@ -59,16 +59,25 @@ async def edit(chat_id, message_id, text, keyboard=None):
         return await send(chat_id, text, keyboard)
 
 
+async def send_via_client_bot(uid: int, text: str) -> bool:
+    """Отправка сообщения клиенту через client_bot_token.
+    Возвращает True, если Telegram подтвердил отправку."""
+    token = cfg('client_bot_token')
+    if not token:
+        log.warning('client_bot_token не задан — отправка клиенту невозможна')
+        return False
+    try:
+        r = await asyncio.to_thread(telegram.api_call, token, 'sendMessage',
+                                    {'chat_id': int(uid), 'text': text[:3990]}, 15)
+        return bool(r.get('ok'))
+    except Exception as e:
+        log.warning('send_via_client_bot failed: %s', type(e).__name__)
+        return False
+
+
 # ─── Нормализация визитов ──────────────────────────────────────────────────
 
 def normalize_visit(v: dict, day: str = '') -> dict:
-    """Приводит визит из любого источника (CRM или БД) к единому виду.
-
-    CRM (crm.extract_item) отдаёт ключи: id, name, phone, time, master, service, ...
-    БД (store.rows_for_date) отдаёт: visit_id, day, at_time, name, phone, ...
-    Эта функция возвращает словарь с visit_id, day, at_time — как ожидает
-    with_delivery и остальной код.
-    """
     if not isinstance(v, dict):
         return {}
     out = dict(v)
@@ -234,6 +243,100 @@ def sms_text(v):
     return f"Здравствуйте! Это NEFOR SPOT. Вы записаны {when}, в {v['at_time']}.\n\nВСЁ В СИЛЕ?\n\nАдрес: {ADDRESS}."
 
 
+# ─── Напоминания ───────────────────────────────────────────────────────────
+
+def reminder_text(v: dict) -> str:
+    d = datetime.fromisoformat(v['day'])
+    now = datetime.now(MSK)
+    day_diff = (d.date() - now.date()).days
+    if day_diff == 0:
+        when = f'сегодня в {v["at_time"]}'
+    elif day_diff == 1:
+        when = f'завтра в {v["at_time"]}'
+    elif day_diff == 2:
+        when = f'послезавтра в {v["at_time"]}'
+    else:
+        when = f'{d:%d.%m} в {v["at_time"]}'
+    return (
+        '🔔 Напоминаем о вашей записи в NEFOR SPOT\n\n'
+        f'Когда: {when}\n'
+        f'Мастер: {v.get("master") or "—"}\n'
+        f'Услуга: {v.get("service") or "—"}\n\n'
+        f'Адрес: {ADDRESS}\n\n'
+        'Если не сможете прийти — напишите администратору заранее.'
+    )
+
+
+def find_client_uid(v: dict):
+    """Кому отправить напоминание: сначала точное совпадение по visit_id
+    (это точно тот, кто записался через Mini App), потом по телефону."""
+    try:
+        uid = store.ledger_telegram_for_visit(int(v.get('visit_id')))
+        if uid:
+            return uid
+    except (TypeError, ValueError):
+        pass
+    phone = store.norm_phone(v.get('phone') or '')
+    if phone:
+        return notify.linked_telegram_id(phone)
+    return None
+
+
+async def deliver_reminder(v: dict, *, kind: str = 'manual') -> tuple[bool, str]:
+    uid = find_client_uid(v)
+    if not uid:
+        return False, 'Не найден Telegram-получатель. Клиент не открывал Mini App и не подтвердил номер.'
+    if store.reminder_already_sent(v['visit_id'], v['day'], v['at_time']):
+        return False, 'Напоминание по этому визиту уже отправлено ранее.'
+    text = reminder_text(v)
+    ok = await send_via_client_bot(uid, text)
+    if not ok:
+        return False, 'Telegram отклонил отправку. Возможно, клиент заблокировал бота.'
+    store.reminder_mark(v['visit_id'], v['day'], v['at_time'], uid, kind)
+    return True, 'Напоминание отправлено клиенту.'
+
+
+async def auto_reminder_loop():
+    """Раз в 15 минут проверяет записи на сегодня и завтра и отправляет
+    напоминание клиенту за 3–12 часов до начала визита.
+    Дубли исключены таблицей reminders."""
+    await asyncio.sleep(45)
+    while True:
+        try:
+            if store.get_setting('auto_reminders', '1') != '1':
+                await asyncio.sleep(15 * 60)
+                continue
+            now = datetime.now(MSK)
+            days = [
+                now.date().isoformat(),
+                (now.date() + timedelta(days=1)).isoformat(),
+            ]
+            visits = []
+            for day in days:
+                try:
+                    rows = await asyncio.to_thread(crm.fetch_day, day)
+                    store.save_visits(day, rows)
+                    visits.extend(store.rows_for_date(day))
+                except Exception as e:
+                    log.warning('auto_reminder fetch %s: %s', day, type(e).__name__)
+            for v in visits:
+                try:
+                    when = datetime.fromisoformat(v['day'] + 'T' + v['at_time']).replace(tzinfo=MSK)
+                except Exception:
+                    continue
+                hours = (when - now).total_seconds() / 3600.0
+                if not (3.0 <= hours <= 12.0):
+                    continue
+                if store.reminder_already_sent(v['visit_id'], v['day'], v['at_time']):
+                    continue
+                ok, reason = await deliver_reminder(v, kind='auto')
+                log.info('auto_reminder visit=%s ok=%s reason=%s', v['visit_id'], ok, reason)
+                await asyncio.sleep(2)
+        except Exception as e:
+            log.exception('auto_reminder_loop error: %s', type(e).__name__)
+        await asyncio.sleep(15 * 60)
+
+
 # ─── Экраны ────────────────────────────────────────────────────────────────
 
 def admin_menu():
@@ -247,12 +350,9 @@ def admin_menu():
 
 
 async def fetch_tomorrow_rows(day: str):
-    """Возвращает визиты в едином формате (visit_id, day, at_time)."""
     try:
         items = await asyncio.to_thread(crm.fetch_day, day)
         store.save_visits(day, items)
-        # ВАЖНО: перечитываем из БД, чтобы формат был единым (visit_id, at_time).
-        # crm.fetch_day отдаёт CRM-формат (id, time) — с ним with_delivery падал.
         return store.rows_for_date(day), True
     except Exception as e:
         log.warning('fetch_tomorrow_rows failed: %s', type(e).__name__)
@@ -274,10 +374,11 @@ async def screen_tomorrow(chat, msg=None):
         b = admin_notice(v)['bucket']
         if b in count:
             count[b] += 1
+    auto_on = store.get_setting('auto_reminders', '1') == '1'
     summary = (f'📅 Завтра · {day}\nВсего: {count["all"]} · '
                f'Уведомлены: {count["notified"]} · Требуют SMS: {count["sms"]} · '
                f'Сверить: {count["check"]}')
-    lines = [summary, '']
+    lines = [summary, f'🔔 Автонапоминания: {"включены" if auto_on else "выключены"}', '']
     for v in enriched[:25]:
         info = admin_notice(v)
         lines.append(f"{v['at_time']} · {v['name']} · {v['master']} — {info['label']}")
@@ -296,6 +397,7 @@ async def screen_tomorrow(chat, msg=None):
                         'callback_data': f"visit:{v['visit_id']}"}])
     kb.append([{'text': '📱 SMS вручную', 'callback_data': 'manual_sms'},
                {'text': '⚠️ Сверить ChatPush', 'callback_data': 'chatpush_check'}])
+    kb.append([{'text': f'🔔 Авто: {"вкл" if auto_on else "выкл"}', 'callback_data': 'remind_toggle'}])
     kb.append([{'text': '🔄 Обновить', 'callback_data': 'tomorrow'},
                {'text': '⚙️ Система', 'callback_data': 'system'}])
     return await edit(chat, msg, '\n'.join(lines)[:3900], inline(kb))
@@ -361,6 +463,11 @@ def visit_keyboard(v):
     phone = v['phone']
     kb = []
     info = admin_notice(v)
+    # Ручное напоминание через клиентский бот
+    can_remind = bool(find_client_uid(v))
+    if can_remind:
+        kb.append([{'text': '🔔 Отправить напоминание в бот',
+                    'callback_data': f"remind:{v['visit_id']}:{v['day']}"}])
     if phone and info['bucket'] == 'sms':
         kb.append([{'text': '📋 Скопировать номер', 'copy_text': {'text': '+' + phone}}])
         kb.append([{'text': '📋 Скопировать текст SMS', 'copy_text': {'text': sms_text(v)}}])
@@ -376,30 +483,47 @@ def visit_keyboard(v):
 
 
 async def screen_visit(chat, msg, visit_id):
-    v = store.find_visit(visit_id)
+    v = store.find_visit_any(visit_id)
     if not v:
         return await edit(chat, msg, 'Запись не найдена.',
                           inline([[{'text': '📅 Завтра', 'callback_data': 'tomorrow'}]]))
     v = with_delivery([v])[0]
     info = admin_notice(v)
+    client_uid = find_client_uid(v)
+    reminder_sent = store.reminder_already_sent(v['visit_id'], v['day'], v['at_time'])
     lines = [f"📋 {v['name']}", f"🗓 {v['day']} · {v['at_time']}",
              f"✂️ {v['master']}", f"🧴 {v['service']}",
              f"📞 +{v['phone'] if v['phone'] else '—'}", '',
              f"Статус: {info['label']}", f"Источник: {info['source']}"]
+    if client_uid:
+        lines.append(f"🔔 Напоминание: {'отправлено' if reminder_sent else 'можно отправить'}")
+    else:
+        lines.append('🔔 Напоминание: клиент не открывал Mini App, отправка невозможна')
     if v['phone'] and info['bucket'] == 'sms':
         lines += ['', 'Текст SMS:', sms_text(v)]
     return await edit(chat, msg, '\n'.join(lines), visit_keyboard(v))
 
 
 async def screen_system(chat, msg=None):
-    body = (f'⚙️ Система · {RELEASE}\n\n'
-            f'🟢 Telegram-бот · запущен\n'
-            f'{"🟢" if crm.crm_configured() else "⚪"} Tetradka CRM\n'
-            f'{"🟢" if chatpush.configured() else "⚪"} ChatPush API\n\n'
-            'Канал уведомлений: ChatPush. SMS — вручную.')
-    return await edit(chat, msg, body,
-                      inline([[{'text': '📱 SMS вручную', 'callback_data': 'manual_sms'}],
-                              [{'text': '🔄 Обновить', 'callback_data': 'system'}]]))
+    auto = store.get_setting('auto_reminders', '1') == '1'
+    auto_legacy = store.get_setting('auto_enabled', '0') == '1'
+    body = (
+        f'⚙️ Система · {RELEASE}\n\n'
+        f'🟢 Telegram-бот · запущен\n'
+        f'{"🟢" if crm.crm_configured() else "⚪"} Tetradka CRM\n'
+        f'{"🟢" if chatpush.configured() else "⚪"} ChatPush API\n\n'
+        f'🔔 Автонапоминания за 3–12 ч: {"ВКЛЮЧЕНЫ" if auto else "выключены"}\n'
+        f'Канал напоминаний: клиентский бот @zalupaspotbot\n\n'
+        f'Уведомления о создании/переносе: внешний ChatPush.\n'
+        f'Ручные SMS: отдельный раздел.'
+    )
+    kb = inline([
+        [{'text': f'{"🔕 Выключить" if auto else "🔔 Включить"} автонапоминания',
+          'callback_data': 'remind_toggle'}],
+        [{'text': '📱 SMS вручную', 'callback_data': 'manual_sms'}],
+        [{'text': '🔄 Обновить', 'callback_data': 'system'}],
+    ])
+    return await edit(chat, msg, body, kb)
 
 
 async def screen_clients(chat, msg=None):
@@ -585,6 +709,24 @@ async def handle_callback(cb):
             return await screen_chatpush_check(chat, mid)
         if key == 'system':
             return await screen_system(chat, mid)
+        if key == 'remind_toggle':
+            current = store.get_setting('auto_reminders', '1')
+            new = '0' if current == '1' else '1'
+            store.set_setting('auto_reminders', new)
+            return await screen_system(chat, mid)
+        if key.startswith('remind:'):
+            parts = key.split(':', 2)
+            if len(parts) < 2:
+                return
+            vid = parts[1]
+            v = store.find_visit_any(vid)
+            if not v:
+                return await edit(chat, mid, 'Запись не найдена.',
+                                  inline([[{'text': '📅 Завтра', 'callback_data': 'tomorrow'}]]))
+            ok, reason = await deliver_reminder(v, kind='manual')
+            prefix = '✅ ' if ok else '⚠️ '
+            v = with_delivery([v])[0]
+            return await screen_visit(chat, mid, vid)
         if key == 'tickets':
             return await screen_tickets(chat, mid)
         if key == 'clients':
@@ -614,7 +756,7 @@ async def handle_callback(cb):
             m = re.match(r'^mark_(sms|confirm|skip|pending):(.+)$', key)
             if m:
                 typ, vid = m.groups()
-                v = store.find_visit(vid)
+                v = store.find_visit_any(vid)
                 if not v:
                     return await screen_tomorrow(chat, mid)
                 if typ == 'sms' and admin_notice(with_delivery([v])[0])['bucket'] != 'sms':
@@ -700,6 +842,7 @@ async def main():
         await tg('deleteWebhook', {'drop_pending_updates': False})
     except Exception as ex:
         log.warning('deleteWebhook: %s', ex)
+    asyncio.create_task(auto_reminder_loop())
     offset = 0
     while True:
         try:
