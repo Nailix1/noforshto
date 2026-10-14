@@ -506,14 +506,12 @@ async def screen_visit(chat, msg, visit_id):
 
 async def screen_system(chat, msg=None):
     auto = store.get_setting('auto_reminders', '1') == '1'
-    auto_legacy = store.get_setting('auto_enabled', '0') == '1'
     body = (
         f'⚙️ Система · {RELEASE}\n\n'
         f'🟢 Telegram-бот · запущен\n'
         f'{"🟢" if crm.crm_configured() else "⚪"} Tetradka CRM\n'
         f'{"🟢" if chatpush.configured() else "⚪"} ChatPush API\n\n'
-        f'🔔 Автонапоминания за 3–12 ч: {"ВКЛЮЧЕНЫ" if auto else "выключены"}\n'
-        f'Канал напоминаний: клиентский бот @zalupaspotbot\n\n'
+        f'🔔 Автонапоминания за 3–12 часов: {"ВКЛЮЧЕНЫ" if auto else "выключены"}\n\n'
         f'Уведомления о создании/переносе: внешний ChatPush.\n'
         f'Ручные SMS: отдельный раздел.'
     )
