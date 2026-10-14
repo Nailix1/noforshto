@@ -48,8 +48,6 @@ def norm_phone(value) -> str:
     return s if re.fullmatch(r'7\d{10}', s) else ''
 
 
-# ─── Инициализация всех баз ─────────────────────────────────────────────────
-
 def initialize() -> None:
     with db(SUPPORT_DB) as con:
         con.executescript('''
@@ -290,26 +288,26 @@ def ledger_start(uid: int, key: str, payload: dict, master_name='', service_name
             if (prev['master_id'], prev['service_id'], prev['appointment_date'], prev['appointment_time']) != \
                (payload['masterID'], payload['serviceID'], payload['date'], payload['timeFrom']):
                 raise ValueError('request_key used')
-            # Если этот requestKey уже приводил к отмене, повторно считаем
-            # попытку новой — клиент имеет право записаться заново.
             if prev['status'] == 'cancelled':
                 con.execute('DELETE FROM attempts WHERE telegram_id=? AND request_key=?', (uid, key))
             else:
                 return _existing(prev)
         now = int(time.time())
-        # Ищем похожую активную попытку. Отменённые (cancelled) НЕ учитываем,
-        # иначе после отмены клиент не сможет записаться на то же время.
+        # similar ищет только НЕЗАВЕРШЁННЫЕ попытки (pending/uncertain).
+        # Ранее здесь был ещё 'done', из-за чего после отмены записи
+        # (у которой отмена не помечала ledger) новая попытка на то же
+        # время возвращала старый visitID и запись физически не создавалась.
         similar = con.execute('''SELECT * FROM attempts WHERE telegram_id=? AND master_id=? AND service_id=?
             AND appointment_date=? AND appointment_time=? AND created_at>?
-            AND status IN ('pending','done','uncertain')
+            AND status IN ('pending','uncertain')
             ORDER BY created_at DESC LIMIT 1''',
             (uid, payload['masterID'], payload['serviceID'], payload['date'],
-             payload['timeFrom'], now - 86400)).fetchone()
+             payload['timeFrom'], now - 300)).fetchone()
         if similar:
             return _existing(similar)
         cnt = con.execute('''SELECT COUNT(*) FROM attempts WHERE telegram_id=? AND created_at>?
             AND status IN ('pending','done','uncertain')''', (uid, now - 900)).fetchone()[0]
-        if cnt >= 3:
+        if cnt >= 6:
             raise ValueError('rate_limited')
         con.execute('''INSERT INTO attempts(telegram_id,request_key,created_at,status,master_id,service_id,
             appointment_date,appointment_time,master_name,service_name,owner_phone)
