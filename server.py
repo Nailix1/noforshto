@@ -80,6 +80,7 @@ def boot_public(mode: str, user: dict) -> dict:
     return {'mode': mode,
             'user': {'id': user['id'], 'first_name': user.get('first_name', ''),
                      'username': user.get('username', '')},
+            'admin_username': cfg('admin_username', 'nefor_spot_admin'),
             'brand': 'NEFOR SPOT',
             'address': cfg('salon_address', 'Разъезжая 42/34'),
             'booking_url': cfg('booking_url', ''),
@@ -363,6 +364,11 @@ class Server(BaseHTTPRequestHandler):
             if path == '/api/booking/create' and mode == 'client':
                 if not cfg('booking_enabled', True):
                     raise HTTPFailure(503, 'Онлайн-запись отключена.')
+                # Защита от фейковых заказов: клиент обязан подтвердить телефон
+                # ДО создания записи в Tetradka.
+                prof = store.profile(uid) or {}
+                if not prof.get('phone_verified') or not prof.get('phone'):
+                    raise HTTPFailure(403, 'Подтверди номер телефона в приложении, прежде чем записаться.')
                 try:
                     original = crm.validate_booking(data)
                     data = dict(data)
