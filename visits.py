@@ -68,6 +68,10 @@ def _when(v: dict):
     return day, at
 
 
+def _is_cancelled_status(value) -> bool:
+    return str(value or '').lower() in ('cancel', 'cancelled', 'canceled')
+
+
 def _capabilities(v: dict):
     day, at = _when(v)
     future = datetime.fromisoformat(day + 'T' + at).replace(tzinfo=MSK) > datetime.now(MSK)
@@ -153,7 +157,18 @@ def my_visits(uid: int) -> dict:
         visits.extend({**v, 'fresh': False, 'status': 'not_checked',
                        'can_cancel': False, 'can_reschedule': False}
                       for v in local if str(v['visitID']) not in found)
-    pending = [_result(r) for r in store.action_pending_for(uid)]
+    # Реконсилим pending-действия: если клиент раньше отменил запись и
+    # действие осталось в состоянии pending (Tetradka вернула ответ не сразу),
+    # при следующем заходе в «Мои записи» мы снова проверим статус и, если
+    # отмена прошла, пометим ledger как 'cancelled'. Это снимает блокировку
+    # для повторной записи на то же время.
+    pending_rows = store.action_pending_for(uid)
+    pending = []
+    for r in pending_rows:
+        try:
+            pending.append(_reconcile(uid, r))
+        except Exception:
+            pending.append(_result(r))
     return {'visits': sorted(visits, key=lambda v: (v['date'], v['time'])),
             'pending_actions': pending,
             'requires_phone': not verified,
@@ -192,7 +207,7 @@ def _result(row: dict) -> dict:
 
 def _matches(row: dict, v: dict) -> bool:
     if row['action'] == 'cancel':
-        return v.get('status') == 'cancel'
+        return _is_cancelled_status(v.get('status'))
     if v.get('status') != 'new' or _when(v) != (row['target_date'], row['target_time']):
         return False
     expected = json.loads(row['result']) if row['result'] else None
