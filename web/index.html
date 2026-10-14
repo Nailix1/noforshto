@@ -84,6 +84,18 @@ button:disabled{cursor:wait;opacity:.6}
 .booking-signature span{font-size:10px;font-weight:900;letter-spacing:.14em;color:var(--pink)}
 .booking-signature b{font-size:12px;font-weight:700;color:#fff0f5;line-height:1.4}
 </style>
+</head>
+<body>
+<div id="app" class="app-shell">
+ <header class="brand-head">
+  <div class="brand-wrap"><img class="official-logo" src="/assets/neforspot-logo.png" alt="NEFOR SPOT"></div>
+  <div class="ticker" aria-label="Адрес и услуги"><div class="ticker-content">НЕФОР СПОТ　•　РАЗЪЕЗЖАЯ 42/34　•　ПН–ВС 12:00–22:00　•　СТРИЖКИ　•　ОКРАШИВАНИЕ　•　УКЛАДКА　　　НЕФОР СПОТ　•　РАЗЪЕЗЖАЯ 42/34　•　ПН–ВС 12:00–22:00　•　СТРИЖКИ　•　ОКРАШИВАНИЕ　•　УКЛАДКА</div></div>
+ </header>
+ <div id="status" class="status-line" role="status" aria-live="polite"></div>
+ <main id="main" class="main" aria-live="polite"><div class="loading">Загружаю NEFOR SPOT…</div></main>
+ <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы приложения"></nav>
+ <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</div>
 <script>
 /* ====== app.js ====== */
 'use strict';
@@ -239,17 +251,5 @@ async function checkVisitAction(){const p=readPending()||{requestKey:ME.actionKe
 async function boot(){try{TG?.ready?.();TG?.expand?.()}catch(e){}if(demo){status('');NAV.innerHTML='';ROOT.innerHTML=adminMode?'<h1 class="page-title">Открой админку через Telegram</h1><p class="page-subtitle">Прямой браузерный адрес не подтверждает права администратора. Запусти NEFOR SPOT ADMIN и открой кнопку Mini App.</p>':'<h1 class="page-title">Запись в NEFOR SPOT</h1><p class="page-subtitle">Для настоящей записи открой Mini App кнопкой внутри Telegram. В браузере без Telegram нельзя подтвердить визит — здесь не показываются вымышленные часы.</p><a class="btn btn-primary btn-block" href="https://t.me/NEFORSPOTBOT" rel="noopener noreferrer">Открыть @NEFORSPOTBOT →</a><p class="section-caption">В боте нажми «Записаться» или «Открыть приложение». После этого будут доступны реальные свободные часы и подтверждение в Tetradka.</p>';return}ROOT.innerHTML='<div class="loading">Подключаю NEFOR SPOT…</div>';try{ME.boot=await api('/api/bootstrap');if(!ME.boot||!ME.boot.user)throw new Error('Сервер вернул некорректные данные запуска.');status(ME.boot.version==='9.4'?'':'Сервер обновляется. При проблемах открой приложение заново.');render();iosProbe('app-ready');if(!adminMode)loadCatalog()}catch(err){iosProbe('app-failed');const url=new URL(location.href);url.searchParams.set('refresh',String(Date.now()));ROOT.innerHTML=`<div class="empty"><h2>Не удалось войти</h2><p>${ESC(err.message)}</p><p>Проверь соединение или обнови приложение.</p><a class="btn btn-primary btn-block" href="${ESC(url.pathname+url.search)}">Обновить приложение</a></div>`;NAV.innerHTML=''}}
 boot();
 </script>
-</head>
-<body>
-<div id="app" class="app-shell">
- <header class="brand-head">
-  <div class="brand-wrap"><img class="official-logo" src="/assets/neforspot-logo.png" alt="NEFOR SPOT"></div>
-  <div class="ticker" aria-label="Адрес и услуги"><div class="ticker-content">НЕФОР СПОТ　•　РАЗЪЕЗЖАЯ 42/34　•　ПН–ВС 12:00–22:00　•　СТРИЖКИ　•　ОКРАШИВАНИЕ　•　УКЛАДКА　　　НЕФОР СПОТ　•　РАЗЪЕЗЖАЯ 42/34　•　ПН–ВС 12:00–22:00　•　СТРИЖКИ　•　ОКРАШИВАНИЕ　•　УКЛАДКА</div></div>
- </header>
- <div id="status" class="status-line" role="status" aria-live="polite"></div>
- <main id="main" class="main" aria-live="polite"><div class="loading">Загружаю NEFOR SPOT…</div></main>
- <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы приложения"></nav>
- <div id="toast" class="toast" role="status" aria-live="polite"></div>
-</div>
 </body>
 </html>
