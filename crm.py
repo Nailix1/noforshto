@@ -8,7 +8,10 @@ from config import cfg, DATA_DIR
 from storage import norm_phone
 
 BASE_URL = 'https://booking-api.tbookme.ru'
-ONLINE_ID = '187686'
+# ID онлайн-записи салона в Tetradka.
+# 187686 — старый салон. Твой ID задаётся через Railway Variables:
+#   NEFOR_TETRADKA_ONLINE_ID=232569
+ONLINE_ID = os.environ.get('NEFOR_TETRADKA_ONLINE_ID', '187686')
 CRM_ROOT = 'https://tetradka.io'
 MSK = timezone(timedelta(hours=3))
 MAX_TIMEOUT = 12
@@ -269,8 +272,6 @@ def bearer(*, force: bool = False) -> str:
     if not crm_configured():
         raise CRMAuthError('CRM Tetradka не подключена.', code='credentials_missing')
     # NEFOR_TETRADKA_FORCE_LOGIN=1 — принудительный перелогин.
-    # Нужен один раз при смене владельца: стирает старый кеш токена,
-    # чтобы записи уходили к новому аккаунту Tetradka.
     if os.environ.get('NEFOR_TETRADKA_FORCE_LOGIN') == '1' and not force:
         force = True
     with _AUTH_LOCK:
@@ -294,8 +295,6 @@ def bearer(*, force: bool = False) -> str:
         candidates = [r for r in roles if isinstance(r, dict) and r.get('type') == 'business']
         if not candidates:
             raise CRMAuthError('Tetradka не вернула роль владельца.', code='business_role_missing')
-        # Если в аккаунте несколько салонов, можно явно указать нужный через
-        # NEFOR_TETRADKA_BUSINESS_USER_ID. Иначе берём первую бизнес-роль.
         want = os.environ.get('NEFOR_TETRADKA_BUSINESS_USER_ID', '').strip()
         if want:
             candidates = [c for c in candidates if str(c.get('userID')) == want]
