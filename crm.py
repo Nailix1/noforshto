@@ -11,7 +11,7 @@ BASE_URL = 'https://booking-api.tbookme.ru'
 # ID онлайн-записи салона в Tetradka.
 # 187686 — старый салон. Твой ID задаётся через Railway Variables:
 #   NEFOR_TETRADKA_ONLINE_ID=232569
-ONLINE_ID = os.environ.get('NEFOR_TETRADKA_ONLINE_ID', '187686')
+ONLINE_ID = os.environ.get('NEFOR_TETRADKA_ONLINE_ID', '232569')
 CRM_ROOT = 'https://tetradka.io'
 MSK = timezone(timedelta(hours=3))
 MAX_TIMEOUT = 12
