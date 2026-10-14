@@ -92,6 +92,7 @@ def initialize() -> None:
             visit_id INTEGER, address_id INTEGER, owner_phone TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(telegram_id,request_key));
         CREATE INDEX IF NOT EXISTS idx_attempts_user ON attempts(telegram_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_attempts_visit ON attempts(visit_id,status);
         CREATE TABLE IF NOT EXISTS client_visit_refs (
             ref TEXT PRIMARY KEY, telegram_id INTEGER NOT NULL,
             visit_id INTEGER NOT NULL, revision TEXT NOT NULL, expires_at INTEGER NOT NULL);
@@ -289,8 +290,15 @@ def ledger_start(uid: int, key: str, payload: dict, master_name='', service_name
             if (prev['master_id'], prev['service_id'], prev['appointment_date'], prev['appointment_time']) != \
                (payload['masterID'], payload['serviceID'], payload['date'], payload['timeFrom']):
                 raise ValueError('request_key used')
-            return _existing(prev)
+            # Если этот requestKey уже приводил к отмене, повторно считаем
+            # попытку новой — клиент имеет право записаться заново.
+            if prev['status'] == 'cancelled':
+                con.execute('DELETE FROM attempts WHERE telegram_id=? AND request_key=?', (uid, key))
+            else:
+                return _existing(prev)
         now = int(time.time())
+        # Ищем похожую активную попытку. Отменённые (cancelled) НЕ учитываем,
+        # иначе после отмены клиент не сможет записаться на то же время.
         similar = con.execute('''SELECT * FROM attempts WHERE telegram_id=? AND master_id=? AND service_id=?
             AND appointment_date=? AND appointment_time=? AND created_at>?
             AND status IN ('pending','done','uncertain')
@@ -317,6 +325,8 @@ def _existing(row) -> dict:
         return {'visitID': row['visit_id'], 'addressID': row['address_id']}
     if row['status'] == 'rejected':
         raise ValueError('rejected')
+    if row['status'] == 'cancelled':
+        raise ValueError('cancelled')
     raise ValueError('uncertain')
 
 
@@ -326,6 +336,16 @@ def ledger_complete(uid: int, key: str, status: str, result=None) -> None:
             WHERE telegram_id=? AND request_key=? AND status='pending' ''',
             (status, result.get('visitID') if result else None,
              result.get('addressID') if result else None, uid, key))
+
+
+def ledger_cancel(visit_id: int) -> None:
+    """Помечает попытку как отменённую. После этого клиент может
+    записаться на то же время повторно — ledger не блокирует."""
+    if not visit_id:
+        return
+    with _LOCK, db(BOOKING_DB) as con:
+        con.execute("UPDATE attempts SET status='cancelled' WHERE visit_id=? AND status='done'",
+                    (int(visit_id),))
 
 
 def ledger_recent(uid: int):
@@ -347,7 +367,7 @@ def ledger_admin_recent(limit: int = 50):
 
 def ledger_owns(uid: int, visit_id: int, crm_phone: str) -> bool:
     with db(BOOKING_DB) as con:
-        row = con.execute("SELECT owner_phone FROM attempts WHERE telegram_id=? AND visit_id=? AND status='done'",
+        row = con.execute("SELECT owner_phone FROM attempts WHERE telegram_id=? AND visit_id=? AND status IN ('done','cancelled')",
                           (uid, int(visit_id))).fetchone()
     return bool(row and (not row['owner_phone'] or norm_phone(row['owner_phone']) == norm_phone(crm_phone)))
 
