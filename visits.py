@@ -225,6 +225,10 @@ def _reconcile(uid: int, row: dict) -> dict:
                             (uid, row['request_key']))
             if row['action'] == 'reschedule':
                 store.ledger_sync_visit(v['visitID'], *_when(v))
+            if row['action'] == 'cancel':
+                # Снимаем блокировку ledger: клиент может записаться заново
+                # на то же время, ту же услугу и того же мастера.
+                store.ledger_cancel(v['visitID'])
             row = {**dict(row), 'state': 'done'}
     except Exception:
         pass
