@@ -59,9 +59,40 @@ async def edit(chat_id, message_id, text, keyboard=None):
         return await send(chat_id, text, keyboard)
 
 
+# ─── Нормализация визитов ──────────────────────────────────────────────────
+
+def normalize_visit(v: dict, day: str = '') -> dict:
+    """Приводит визит из любого источника (CRM или БД) к единому виду.
+
+    CRM (crm.extract_item) отдаёт ключи: id, name, phone, time, master, service, ...
+    БД (store.rows_for_date) отдаёт: visit_id, day, at_time, name, phone, ...
+    Эта функция возвращает словарь с visit_id, day, at_time — как ожидает
+    with_delivery и остальной код.
+    """
+    if not isinstance(v, dict):
+        return {}
+    out = dict(v)
+    if 'visit_id' not in out and 'id' in out:
+        out['visit_id'] = out['id']
+    if 'day' not in out and day:
+        out['day'] = day
+    if 'at_time' not in out and 'time' in out:
+        out['at_time'] = out['time']
+    if 'notifications_disabled' not in out:
+        out['notifications_disabled'] = 0
+    if 'manual_state' not in out:
+        out['manual_state'] = 'pending'
+    return out
+
+
+def normalize_rows(rows, day: str = '') -> list:
+    return [normalize_visit(v, day) for v in (rows or []) if isinstance(v, dict)]
+
+
 # ─── Обогащение и статусы ──────────────────────────────────────────────────
 
 def with_delivery(rows):
+    rows = normalize_rows(rows)
     found = notify.delivery_for_visits(rows)
     external = chatpush.for_visits(rows)
     external_checked = chatpush.external_for_visits(rows)
@@ -166,7 +197,7 @@ def admin_notice(v):
                     'source': 'Последний подтверждённый ответ Telegram'}
         if history.get('state') == 'pending':
             return {'bucket': 'check', 'label': 'ChatPush · в очереди', 'klass': 'warn',
-                    'source': 'Не отправлять SMS до окончательного результата'}
+                    'source': 'Не отправлять SMS до результата'}
         if history.get('state') == 'telegram':
             return {'bucket': 'notified', 'label': 'Telegram · ChatPush', 'klass': 'ok',
                     'source': 'Последнее Telegram-сообщение'}
@@ -189,7 +220,7 @@ def admin_notice(v):
                 'source': 'Проверено администратором'}
     if state == 'check':
         return {'bucket': 'check', 'label': 'Сверить историю ChatPush', 'klass': 'warn',
-                'source': 'Неизвестный результат не означает необходимость SMS'}
+                'source': 'Неизвестный результат ≠ нужна SMS'}
     if not v.get('phone'):
         return {'bucket': 'other', 'label': 'Нет номера', 'klass': 'warn', 'source': 'Тетрадка'}
     return {'bucket': 'check', 'label': 'ChatPush не сверен', 'klass': 'warn',
@@ -215,16 +246,29 @@ def admin_menu():
     return {'keyboard': rows, 'resize_keyboard': True, 'is_persistent': True}
 
 
+async def fetch_tomorrow_rows(day: str):
+    """Возвращает визиты в едином формате (visit_id, day, at_time)."""
+    try:
+        items = await asyncio.to_thread(crm.fetch_day, day)
+        store.save_visits(day, items)
+        # ВАЖНО: перечитываем из БД, чтобы формат был единым (visit_id, at_time).
+        # crm.fetch_day отдаёт CRM-формат (id, time) — с ним with_delivery падал.
+        return store.rows_for_date(day), True
+    except Exception as e:
+        log.warning('fetch_tomorrow_rows failed: %s', type(e).__name__)
+        return store.rows_for_date(day), False
+
+
 async def screen_tomorrow(chat, msg=None):
     day = crm.appointment_day()
+    rows, fresh = await fetch_tomorrow_rows(day)
     try:
-        rows = await asyncio.to_thread(crm.fetch_day, day)
-        store.save_visits(day, rows)
-        fresh = True
-    except Exception:
-        rows = store.rows_for_date(day)
-        fresh = False
-    enriched = with_delivery(rows)
+        enriched = with_delivery(rows)
+    except Exception as e:
+        log.exception('with_delivery failed in screen_tomorrow')
+        return await edit(chat, msg,
+            f'⚠️ Ошибка при разборе визитов: {type(e).__name__}: {str(e)[:200]}',
+            inline([[{'text': '🔄 Повторить', 'callback_data': 'tomorrow'}]]))
     count = {'all': len(enriched), 'notified': 0, 'sms': 0, 'check': 0, 'other': 0}
     for v in enriched:
         b = admin_notice(v)['bucket']
@@ -238,7 +282,7 @@ async def screen_tomorrow(chat, msg=None):
         info = admin_notice(v)
         lines.append(f"{v['at_time']} · {v['name']} · {v['master']} — {info['label']}")
     if not enriched:
-        lines.append('Завтра записей нет.')
+        lines.append('Завтра записей нет.' if fresh else 'Расписание не загружено.')
     kb = []
     for v in enriched[:20]:
         info = admin_notice(v)
@@ -260,14 +304,19 @@ async def screen_tomorrow(chat, msg=None):
 async def screen_manual_sms(chat, msg=None):
     day = crm.appointment_day()
     try:
-        rows = await asyncio.to_thread(crm.fetch_day, day)
-        store.save_visits(day, rows)
+        rows, _ = await fetch_tomorrow_rows(day)
     except Exception:
         return await edit(chat, msg,
             '⚠️ Расписание не загружено. Не отправляй SMS по сохранённым данным.',
             inline([[{'text': '🔄 Повторить', 'callback_data': 'manual_sms'},
                      {'text': '📅 Назад', 'callback_data': 'tomorrow'}]]))
-    enriched = with_delivery(rows)
+    try:
+        enriched = with_delivery(rows)
+    except Exception as e:
+        log.exception('with_delivery failed in screen_manual_sms')
+        return await edit(chat, msg,
+            f'⚠️ Ошибка: {type(e).__name__}: {str(e)[:200]}',
+            inline([[{'text': '🔄 Повторить', 'callback_data': 'manual_sms'}]]))
     manual = [v for v in enriched if admin_notice(v)['bucket'] == 'sms']
     lines = [f'📱 SMS ВРУЧНУЮ · {day}', f'Подтверждённых задач: {len(manual)}', '']
     for v in manual[:30]:
@@ -284,12 +333,18 @@ async def screen_manual_sms(chat, msg=None):
 async def screen_chatpush_check(chat, msg=None):
     day = crm.appointment_day()
     try:
-        rows = await asyncio.to_thread(crm.fetch_day, day)
-        store.save_visits(day, rows)
+        rows, _ = await fetch_tomorrow_rows(day)
     except Exception:
         return await edit(chat, msg, '⚠️ Нет свежих визитов Тетрадки.',
                           inline([[{'text': '🔄 Повторить', 'callback_data': 'chatpush_check'}]]))
-    check = [v for v in with_delivery(rows) if admin_notice(v)['bucket'] == 'check']
+    try:
+        enriched = with_delivery(rows)
+    except Exception as e:
+        log.exception('with_delivery failed in screen_chatpush_check')
+        return await edit(chat, msg,
+            f'⚠️ Ошибка: {type(e).__name__}: {str(e)[:200]}',
+            inline([[{'text': '🔄 Повторить', 'callback_data': 'chatpush_check'}]]))
+    check = [v for v in enriched if admin_notice(v)['bucket'] == 'check']
     lines = [f'⚠️ СВЕРКА CHATPUSH · {day}', f'Нет подтверждённого результата: {len(check)}', '']
     for v in check[:30]:
         lines.append(f"{v['at_time']} · {v['name']} · {v['master']}")
@@ -469,11 +524,23 @@ async def handle_message(msg):
             return await screen_tomorrow(chat)
         return
     if txt in ('📅 Завтра', '/tomorrow'):
-        return await screen_tomorrow(chat)
+        try:
+            return await screen_tomorrow(chat)
+        except Exception as e:
+            log.exception('screen_tomorrow failed')
+            return await send(chat, f'⚠️ Не удалось открыть расписание.\n\n{type(e).__name__}: {str(e)[:200]}')
     if txt in ('📱 SMS вручную', '/sms'):
-        return await screen_manual_sms(chat)
+        try:
+            return await screen_manual_sms(chat)
+        except Exception as e:
+            log.exception('screen_manual_sms failed')
+            return await send(chat, f'⚠️ Ошибка SMS.\n\n{type(e).__name__}: {str(e)[:200]}')
     if txt in ('⚠️ Сверить ChatPush', '/chatpush'):
-        return await screen_chatpush_check(chat)
+        try:
+            return await screen_chatpush_check(chat)
+        except Exception as e:
+            log.exception('screen_chatpush_check failed')
+            return await send(chat, f'⚠️ Ошибка сверки.\n\n{type(e).__name__}: {str(e)[:200]}')
     if txt in ('👥 База клиентов', '/clients'):
         return await screen_clients(chat)
     if txt in ('⚙️ Система', '/system'):
@@ -509,91 +576,98 @@ async def handle_callback(cb):
     mid = cb['message']['message_id']
     key = cb.get('data', '')
 
-    if key in ('tomorrow', 'home'):
-        return await screen_tomorrow(chat, mid)
-    if key == 'manual_sms':
-        return await screen_manual_sms(chat, mid)
-    if key == 'chatpush_check':
-        return await screen_chatpush_check(chat, mid)
-    if key == 'system':
-        return await screen_system(chat, mid)
-    if key == 'tickets':
-        return await screen_tickets(chat, mid)
-    if key == 'clients':
-        return await screen_clients(chat, mid)
-    if key == 'cl_refresh':
-        CLIENT_CACHE['data'] = None
-        return await screen_clients(chat, mid)
-    if key.startswith('cllist:'):
-        _, seg, page = key.split(':', 2)
-        if seg in ('all', 'active', 'sleep', 'lost'):
-            return await screen_client_list(chat, mid, seg, int(page))
-    if key.startswith('client:'):
-        return await screen_client(chat, mid, key[7:])
-    if key.startswith('ticket_reply:'):
-        tid = int(key.split(':', 1)[1])
-        REPLY_WAITING[chat] = tid
-        return await send(chat, f'💬 Ответ на #{tid}. Пришли текст или /cancel.')
-    if key.startswith('ticket_close:'):
-        tid = int(key.split(':', 1)[1])
-        store.set_ticket_status(tid, 'closed')
-        return await screen_ticket(chat, mid, tid)
-    if key.startswith('ticket:'):
-        return await screen_ticket(chat, mid, int(key.split(':', 1)[1]))
-    if key.startswith('visit:'):
-        return await screen_visit(chat, mid, key[6:])
-    if key.startswith('mark_'):
-        m = re.match(r'^mark_(sms|confirm|skip|pending):(.+)$', key)
-        if m:
-            typ, vid = m.groups()
-            v = store.find_visit(vid)
-            if not v:
-                return await screen_tomorrow(chat, mid)
-            if typ == 'sms' and admin_notice(with_delivery([v])[0])['bucket'] != 'sms':
-                return await edit(chat, mid, 'Нет подтверждения недоставки ChatPush.',
-                                  inline([[{'text': '📱 SMS', 'callback_data': 'manual_sms'}]]))
-            new_state = {'sms': 'sms_sent', 'confirm': 'confirmed',
-                         'skip': 'skipped', 'pending': 'pending'}[typ]
-            store.update_manual_state(vid, v['day'], new_state)
-            if typ in ('sms', 'confirm', 'skip'):
-                notify.close_manual_tasks(vid, v['day'],
-                    {'sms': 'manual_sms_sent', 'confirm': 'manual_confirmed',
-                     'skip': 'manual_skipped'}[typ])
+    try:
+        if key in ('tomorrow', 'home'):
+            return await screen_tomorrow(chat, mid)
+        if key == 'manual_sms':
+            return await screen_manual_sms(chat, mid)
+        if key == 'chatpush_check':
+            return await screen_chatpush_check(chat, mid)
+        if key == 'system':
+            return await screen_system(chat, mid)
+        if key == 'tickets':
+            return await screen_tickets(chat, mid)
+        if key == 'clients':
+            return await screen_clients(chat, mid)
+        if key == 'cl_refresh':
+            CLIENT_CACHE['data'] = None
+            return await screen_clients(chat, mid)
+        if key.startswith('cllist:'):
+            _, seg, page = key.split(':', 2)
+            if seg in ('all', 'active', 'sleep', 'lost'):
+                return await screen_client_list(chat, mid, seg, int(page))
+        if key.startswith('client:'):
+            return await screen_client(chat, mid, key[7:])
+        if key.startswith('ticket_reply:'):
+            tid = int(key.split(':', 1)[1])
+            REPLY_WAITING[chat] = tid
+            return await send(chat, f'💬 Ответ на #{tid}. Пришли текст или /cancel.')
+        if key.startswith('ticket_close:'):
+            tid = int(key.split(':', 1)[1])
+            store.set_ticket_status(tid, 'closed')
+            return await screen_ticket(chat, mid, tid)
+        if key.startswith('ticket:'):
+            return await screen_ticket(chat, mid, int(key.split(':', 1)[1]))
+        if key.startswith('visit:'):
+            return await screen_visit(chat, mid, key[6:])
+        if key.startswith('mark_'):
+            m = re.match(r'^mark_(sms|confirm|skip|pending):(.+)$', key)
+            if m:
+                typ, vid = m.groups()
+                v = store.find_visit(vid)
+                if not v:
+                    return await screen_tomorrow(chat, mid)
+                if typ == 'sms' and admin_notice(with_delivery([v])[0])['bucket'] != 'sms':
+                    return await edit(chat, mid, 'Нет подтверждения недоставки ChatPush.',
+                                      inline([[{'text': '📱 SMS', 'callback_data': 'manual_sms'}]]))
+                new_state = {'sms': 'sms_sent', 'confirm': 'confirmed',
+                             'skip': 'skipped', 'pending': 'pending'}[typ]
+                store.update_manual_state(vid, v['day'], new_state)
+                if typ in ('sms', 'confirm', 'skip'):
+                    notify.close_manual_tasks(vid, v['day'],
+                        {'sms': 'manual_sms_sent', 'confirm': 'manual_confirmed',
+                         'skip': 'manual_skipped'}[typ])
+                return await screen_visit(chat, mid, vid)
+        if key.startswith('cp_mark_'):
+            m = re.fullmatch(r'cp_mark_(delivered|failed):([0-9]+)', key)
+            if not m:
+                return
+            state, vid = m.groups()
+            day = crm.appointment_day()
+            try:
+                live = await asyncio.to_thread(crm.fetch_day, day)
+            except Exception:
+                return await edit(chat, mid, 'Нет свежего расписания.')
+            visit = next((v for v in live if str(v.get('id')) == vid), None)
+            if not visit:
+                return await screen_chatpush_check(chat, mid)
+            question = ('Telegram доставлен — исключить из SMS.' if state == 'delivered'
+                        else 'Telegram НЕ доставлен — включить в SMS.')
+            return await edit(chat, mid,
+                f"Проверил(а) историю ChatPush для {visit['time']} · {visit['name']}?\n{question}",
+                inline([[{'text': '✅ Сохранить', 'callback_data': f"cp_save_{state}:{vid}"}],
+                        [{'text': '❌ Отмена', 'callback_data': f"visit:{vid}"}]]))
+        if key.startswith('cp_save_'):
+            m = re.fullmatch(r'cp_save_(delivered|failed):([0-9]+)', key)
+            if not m:
+                return
+            state, vid = m.groups()
+            day = crm.appointment_day()
+            try:
+                live = await asyncio.to_thread(crm.fetch_day, day)
+            except Exception:
+                return await edit(chat, mid, 'Нет свежего расписания.')
+            visit = next((v for v in live if str(v.get('id')) == vid), None)
+            if not visit:
+                return await screen_chatpush_check(chat, mid)
+            chatpush.reconcile_external(vid, day, visit['time'], state)
             return await screen_visit(chat, mid, vid)
-    if key.startswith('cp_mark_'):
-        m = re.fullmatch(r'cp_mark_(delivered|failed):([0-9]+)', key)
-        if not m:
-            return
-        state, vid = m.groups()
-        day = crm.appointment_day()
+    except Exception as e:
+        log.exception('handle_callback failed for %s', key)
         try:
-            live = await asyncio.to_thread(crm.fetch_day, day)
+            return await send(chat, f'⚠️ Ошибка: {type(e).__name__}: {str(e)[:200]}')
         except Exception:
-            return await edit(chat, mid, 'Нет свежего расписания.')
-        visit = next((v for v in live if str(v.get('id')) == vid), None)
-        if not visit:
-            return await screen_chatpush_check(chat, mid)
-        question = ('Telegram доставлен — исключить из SMS.' if state == 'delivered'
-                    else 'Telegram НЕ доставлен — включить в SMS.')
-        return await edit(chat, mid,
-            f"Проверил(а) историю ChatPush для {visit['time']} · {visit['name']}?\n{question}",
-            inline([[{'text': '✅ Сохранить', 'callback_data': f"cp_save_{state}:{vid}"}],
-                    [{'text': '❌ Отмена', 'callback_data': f"visit:{vid}"}]]))
-    if key.startswith('cp_save_'):
-        m = re.fullmatch(r'cp_save_(delivered|failed):([0-9]+)', key)
-        if not m:
-            return
-        state, vid = m.groups()
-        day = crm.appointment_day()
-        try:
-            live = await asyncio.to_thread(crm.fetch_day, day)
-        except Exception:
-            return await edit(chat, mid, 'Нет свежего расписания.')
-        visit = next((v for v in live if str(v.get('id')) == vid), None)
-        if not visit:
-            return await screen_chatpush_check(chat, mid)
-        chatpush.reconcile_external(vid, day, visit['time'], state)
-        return await screen_visit(chat, mid, vid)
+            pass
 
 
 async def safe_notice(text):
