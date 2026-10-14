@@ -113,8 +113,14 @@ def initialize() -> None:
             PRIMARY KEY(visit_id,day));
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS calendar_snapshots (day TEXT PRIMARY KEY, fetched_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS reminders (
+            visit_id TEXT NOT NULL, day TEXT NOT NULL, at_time TEXT NOT NULL,
+            telegram_id INTEGER NOT NULL, sent_at TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'auto',
+            PRIMARY KEY(visit_id, day, at_time));
         ''')
         con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('auto_enabled','0')")
+        con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('auto_reminders','1')")
 
 
 # ─── Профили ────────────────────────────────────────────────────────────────
@@ -293,10 +299,6 @@ def ledger_start(uid: int, key: str, payload: dict, master_name='', service_name
             else:
                 return _existing(prev)
         now = int(time.time())
-        # similar ищет только НЕЗАВЕРШЁННЫЕ попытки (pending/uncertain).
-        # Ранее здесь был ещё 'done', из-за чего после отмены записи
-        # (у которой отмена не помечала ledger) новая попытка на то же
-        # время возвращала старый visitID и запись физически не создавалась.
         similar = con.execute('''SELECT * FROM attempts WHERE telegram_id=? AND master_id=? AND service_id=?
             AND appointment_date=? AND appointment_time=? AND created_at>?
             AND status IN ('pending','uncertain')
@@ -337,8 +339,6 @@ def ledger_complete(uid: int, key: str, status: str, result=None) -> None:
 
 
 def ledger_cancel(visit_id: int) -> None:
-    """Помечает попытку как отменённую. После этого клиент может
-    записаться на то же время повторно — ledger не блокирует."""
     if not visit_id:
         return
     with _LOCK, db(BOOKING_DB) as con:
@@ -374,6 +374,18 @@ def ledger_sync_visit(visit_id: int, day: str, at_time: str) -> None:
     with db(BOOKING_DB) as con:
         con.execute("UPDATE attempts SET appointment_date=?,appointment_time=? WHERE visit_id=? AND status='done'",
                     (day, at_time, int(visit_id)))
+
+
+def ledger_telegram_for_visit(visit_id) -> int | None:
+    """Telegram ID клиента, создавшего визит через Mini App. None если не найдено."""
+    try:
+        with db(BOOKING_DB) as con:
+            row = con.execute('''SELECT telegram_id FROM attempts
+                WHERE visit_id=? AND status IN ('done','cancelled')
+                ORDER BY created_at DESC LIMIT 1''', (int(visit_id),)).fetchone()
+            return int(row['telegram_id']) if row else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ─── Visit refs ─────────────────────────────────────────────────────────────
@@ -475,7 +487,31 @@ def find_visit(visit_id, day=None):
         return dict(r) if r else None
 
 
+def find_visit_any(visit_id):
+    with db(ADMIN_DB) as con:
+        r = con.execute('SELECT * FROM visits WHERE visit_id=? ORDER BY day DESC LIMIT 1', (str(visit_id),)).fetchone()
+        return dict(r) if r else None
+
+
 def update_manual_state(visit_id, day, state) -> bool:
     with db(ADMIN_DB) as con:
         return con.execute('UPDATE visits SET manual_state=? WHERE visit_id=? AND day=?',
                            (state, visit_id, day)).rowcount > 0
+
+
+# ─── Напоминания ────────────────────────────────────────────────────────────
+
+def reminder_already_sent(visit_id, day: str, at_time: str) -> bool:
+    with db(ADMIN_DB) as con:
+        row = con.execute('''SELECT 1 FROM reminders
+            WHERE visit_id=? AND day=? AND at_time=?''',
+            (str(visit_id), str(day), str(at_time))).fetchone()
+        return bool(row)
+
+
+def reminder_mark(visit_id, day: str, at_time: str, telegram_id: int, kind: str = 'auto') -> None:
+    with db(ADMIN_DB) as con:
+        con.execute('''INSERT OR REPLACE INTO reminders
+            (visit_id, day, at_time, telegram_id, sent_at, kind)
+            VALUES (?,?,?,?,?,?)''',
+            (str(visit_id), str(day), str(at_time), int(telegram_id), _now(), str(kind)))
