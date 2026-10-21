@@ -12,10 +12,10 @@ _ENV_MAP = {
     'bot_token': 'NEFOR_ADMIN_BOT_TOKEN',
     'client_bot_token': 'NEFOR_CLIENT_BOT_TOKEN',
     'admin_id': 'NEFOR_ADMIN_ID',
-    'tetradka_token': 'NEFOR_TETRADKA_TOKEN',
     'miniapp_url': 'NEFOR_MINIAPP_URL',
     'salon_address': 'NEFOR_SALON_ADDRESS',
     'booking_url': 'NEFOR_BOOKING_URL',
+    'crm_url': 'NEFOR_CRM_URL',
 }
 
 
